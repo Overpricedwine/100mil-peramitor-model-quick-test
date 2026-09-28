@@ -1,0 +1,24 @@
+# Python and local editor state
+__pycache__/
+*.py[cod]
+.venv/
+.env
+
+# Generated training/running artifacts (keep source and small examples in Git)
+runs/
+work/
+data/*.jsonl
+data/*.json
+*.pt
+*.pth
+*.safetensors
+*.ppm
+*.png
+*.jpg
+
+# Hugging Face model/tokenizer caches are machine-local
+.cache/
+hf_cache/
+
+# Persistent user projects can contain private requests
+session.json

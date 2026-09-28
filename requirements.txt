@@ -1,0 +1,6 @@
+# Install the CUDA-specific torch wheel for your Vast.ai image first.
+torch>=2.3
+transformers>=4.49
+accelerate>=1.0
+pillow>=10.0
+tokenizers>=0.20
