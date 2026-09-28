@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 
 from scene_agent.grammar import parse_generated_json
+from scene_agent.prompt_templates import FUNCTION_GENERATOR_SYSTEM_PROMPT
 from scene_agent.tokenizer import SceneBPETokenizer
 from scene_agent.transformer import SceneFunctionTransformer
 
@@ -33,7 +34,7 @@ def main() -> None:
     model.load_state_dict(checkpoint["model"])
     model.eval()
     tokenizer = SceneBPETokenizer.load(arguments.tokenizer)
-    prefix = f"<scene>\n{arguments.context}\n</scene>\n<function>\n"
+    prefix = f"<scene>\n{FUNCTION_GENERATOR_SYSTEM_PROMPT}\n{arguments.context}\n</scene>\n<function>\n"
     prefix_ids = tokenizer.encode(prefix, add_bos=True)[-model.config.context_length:]
     prompt = torch.tensor([prefix_ids], device=device)
     failures: list[str] = []

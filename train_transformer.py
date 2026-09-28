@@ -14,6 +14,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
 from scene_agent.grammar import validate_generated_call
+from scene_agent.prompt_templates import FUNCTION_GENERATOR_SYSTEM_PROMPT
 from scene_agent.tokenizer import SceneBPETokenizer
 from scene_agent.transformer import SceneFunctionTransformer, TransformerConfig
 
@@ -26,7 +27,7 @@ class FunctionDataset(Dataset):
                 continue
             record = json.loads(line)
             target = json.dumps(validate_generated_call(json.loads(record["target"])), separators=(",", ":"))
-            prefix = f"<scene>\n{record['context']}\n</scene>\n<function>\n"
+            prefix = f"<scene>\n{FUNCTION_GENERATOR_SYSTEM_PROMPT}\n{record['context']}\n</scene>\n<function>\n"
             prefix_ids = tokenizer.encode(prefix, add_bos=True)
             target_ids = tokenizer.encode(target, add_eos=True)
             token_ids = (prefix_ids + target_ids)[-context_length:]

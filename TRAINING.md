@@ -12,6 +12,11 @@ training assets:
    restoration, then longer conversations with existing scenes.
 5. Checkpoints, metrics, and a human-reviewed holdout set.
 
+The scene catalogue must deliberately balance buildings, objects/props,
+vehicles, furniture, tools, and environment pieces. Character or creature
+examples are optional categories, never the default. Every seed request and
+grade uses a low-poly constraint: simple primitives and readable silhouettes.
+
 ## Recommended data flow
 
 ```text
@@ -22,6 +27,8 @@ deterministic scene specification
   -> train the Transformer
   -> render its predicted scene
   -> local visual grader scores request vs. renders + metadata
+  -> conversation director reads the complete saved scene + grade and writes
+     one small next improvement request, or ends the conversation
   -> use grader scores for ranking/repair/RL after supervised training
 ```
 
