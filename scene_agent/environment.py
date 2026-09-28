@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 import torch
@@ -33,7 +34,7 @@ class RenderInTheLoopEnv:
         values.extend([0.0] * (12 - len(values)))
         return torch.tensor([values], device=self.renderer.device, dtype=torch.float32)
 
-    def step(self, choice: PolicyChoice) -> StepResult:
+    def step(self, choice: PolicyChoice, *, suggestion_seed: int | None = None) -> StepResult:
         operation = choice.operation
         if operation == 3:
             return StepResult(0.0, Grade(self.previous_score, [], []), None, True)
@@ -54,8 +55,15 @@ class RenderInTheLoopEnv:
                 "size": [side, side, side], "color": list(palette[choice.color % len(palette)]),
             })
         graph = self.session.rebuild()
-        grade = self.grader.grade(self.session.title, graph, self.renderer.render(graph))
+        review_context = {
+            "original_goal": self.session.title, "last_function_id": function_id,
+            "previous_grade": self.previous_score, "session": self.session.model_context(),
+        }
+        grade = self.grader.grade(
+            self.session.title, graph, self.renderer.render(graph), review_context=review_context,
+            suggestion_seed=suggestion_seed,
+        )
         reward = (grade.score - self.previous_score) / 100.0
         self.previous_score = grade.score
-        self.session.record_turn("grader", f"score={grade.score:.1f}; feedback={grade.feedback}")
+        self.session.record_turn("grader", json.dumps(grade.as_dict(), separators=(",", ":")))
         return StepResult(reward, grade, function_id, False)

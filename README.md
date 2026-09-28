@@ -94,6 +94,49 @@ backpropagated through Studio.
 one validated update, one CUDA render, and one grade. Its neural policy is
 small on purpose; it validates the architecture, not final model quality.
 
+## Complete 100M scene cycle
+
+After supervised training, use `run_scene_cycle.py` for the persistent
+generation/refinement loop:
+
+```text
+saved session + original goal
+  -> 100M Transformer generates one grammar-constrained function
+  -> validated function mutates/rebuilds the saved scene
+  -> CUDA front/side/top renders
+  -> local Qwen visual grade with full conversation/history
+  -> ordered repair queue
+  -> local Qwen director writes one next objective to session
+  -> repeat, or finish
+```
+
+```bash
+python run_scene_cycle.py --checkpoint runs/transformer/checkpoint-10000.pt \
+  --tokenizer runs/transformer/scene_tokenizer.json \
+  --session runs/my_bridge --goal "Build a low-poly stone bridge with rails." \
+  --max-steps 20 --grader qwen
+```
+
+Add `--explore-seed 42` only when creating diverse, reproducible training
+conversations. Omit it for stable evaluation. The script shares one local Qwen
+checkpoint between the visual grader and conversation director to conserve GPU
+memory. It saves each step's multi-view renders and the full conversation
+to the session directory. It also appends `trajectory.jsonl`, including the
+exact context before each call, the emitted function, grade, and a review
+candidate flag. It does not update neural-network weights automatically:
+filter candidate traces with the visual grade and human/Studio review before
+using them in later supervised or RL runs.
+
+### Fast final-quality preview renderer
+
+`run_scene_cycle.py` defaults to `--renderer beauty`: a CUDA ray-cast preview
+renderer with perspective/orthographic cameras, depth, rotations, primitive
+surface normals, directional lighting, material response, and a ground plane.
+It additionally writes `beauty.ppm` for a human-facing perspective preview.
+Use `--renderer surrogate` for the older, low-resolution reward renderer when
+running many cheap RL rollouts. Neither renderer claims to be Roblox Studio;
+the Studio interpreter and a Studio screenshot remain the final visual check.
+
 ## 100M Transformer generator
 
 `scene_agent/transformer.py` now implements the actual generator:

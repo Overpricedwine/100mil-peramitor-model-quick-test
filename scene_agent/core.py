@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import time
-import uuid
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable
@@ -62,7 +61,9 @@ class SceneFunction:
         if len(rotation) != 3:
             raise ValueError("rotation must contain X, Y, and Z degrees")
         return cls(
-            id=uuid.uuid4().hex,
+            # The session assigns a short stable ID on insertion.  A model must
+            # be able to copy this ID later to edit/delete the same function.
+            id="",
             op="add_part",
             payload={
                 "name": name,
@@ -86,7 +87,7 @@ class SceneFunction:
             raise ValueError(f"unsupported part properties: {sorted(unknown)}")
         if not properties:
             raise ValueError("set_part_properties requires at least one property")
-        return cls(id=uuid.uuid4().hex, op="set_part_properties",
+        return cls(id="", op="set_part_properties",
                    payload={"target_id": target_id, "properties": properties})
 
     @classmethod
@@ -195,6 +196,8 @@ class SceneSession:
         self.save()
 
     def add_function(self, function: SceneFunction) -> SceneFunction:
+        if not function.id:
+            function.id = self._next_function_id()
         if any(existing.id == function.id for existing in self.functions):
             raise ValueError(f"duplicate function id {function.id}")
         known = {item.id for item in self.functions}
@@ -204,6 +207,14 @@ class SceneSession:
         self.functions.append(function)
         self.save()
         return function
+
+    def _next_function_id(self) -> str:
+        """Readable, deterministic IDs make editing actions learnable/copyable."""
+        number = 1
+        existing = {item.id for item in self.functions}
+        while (candidate := f"fn_{number:06d}") in existing:
+            number += 1
+        return candidate
 
     def delete_function(self, target_id: str) -> None:
         function = self._find(target_id)
@@ -368,6 +379,9 @@ class SceneSession:
             "scene": graph.metadata(),
             "active_function_ids": [item.id for item in self.functions if item.active],
             "active_functions": [asdict(item) for item in self.functions if item.active],
+            # Restores must be able to refer to a deleted function, so never
+            # hide history from the model's saved scene context.
+            "function_history": [asdict(item) for item in self.functions],
             "conversation": [asdict(turn) for turn in turns],
             "history_location": str(self.path),
         }

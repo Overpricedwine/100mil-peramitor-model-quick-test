@@ -55,11 +55,16 @@ def main() -> None:
     parser.add_argument("--data", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("runs/transformer"))
     parser.add_argument("--steps", type=int, default=10_000)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1, help="Micro-batch; keep at 1 on a 12 GB GPU")
+    parser.add_argument("--gradient-accumulation", type=int, default=8,
+                        help="Micro-batches per optimizer update; default effective batch is 8")
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--tokenizer", type=Path)
+    parser.add_argument("--precision", choices=("auto", "bf16", "fp16", "fp32"), default="auto")
     arguments = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if arguments.batch_size < 1 or arguments.gradient_accumulation < 1:
+        raise ValueError("--batch-size and --gradient-accumulation must be positive")
     arguments.output.mkdir(parents=True, exist_ok=True)
     tokenizer_path = arguments.tokenizer or arguments.output / "scene_tokenizer.json"
     if tokenizer_path.exists():
@@ -73,24 +78,47 @@ def main() -> None:
     model = SceneFunctionTransformer(config).to(device)
     dataset = FunctionDataset(arguments.data, tokenizer, config.context_length)
     loader = DataLoader(dataset, batch_size=arguments.batch_size, shuffle=True,
-                        collate_fn=lambda batch: collate(batch, tokenizer.pad_id))
+                        collate_fn=lambda batch: collate(batch, tokenizer.pad_id), pin_memory=device.type == "cuda")
+    if device.type == "cuda":
+        # Tensor Core matmuls and PyTorch's fused causal SDPA/Flash path make
+        # the RTX 5090 useful for this 2k-context Transformer, not just large.
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
     optimizer = torch.optim.AdamW(model.parameters(), lr=arguments.learning_rate, betas=(0.9, 0.95), weight_decay=0.1)
-    print(f"device={device}; parameters={model.parameter_count:,}; examples={len(dataset):,}")
+    if arguments.precision == "auto":
+        precision = "bf16" if device.type == "cuda" else "fp32"
+    else:
+        precision = arguments.precision
+    if precision != "fp32" and device.type != "cuda":
+        raise ValueError("bf16/fp16 require CUDA")
+    amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(precision)
+    scaler = torch.cuda.amp.GradScaler(enabled=precision == "fp16")
+    effective_batch = arguments.batch_size * arguments.gradient_accumulation
+    print(f"device={device}; precision={precision}; parameters={model.parameter_count:,}; examples={len(dataset):,}; "
+          f"micro_batch={arguments.batch_size}; effective_batch={effective_batch}")
     model.train()
     iterator = iter(loader)
     for step in range(1, arguments.steps + 1):
-        try:
-            token_ids, labels = next(iterator)
-        except StopIteration:
-            iterator = iter(loader)
-            token_ids, labels = next(iterator)
-        result = model(token_ids.to(device), labels.to(device))
         optimizer.zero_grad(set_to_none=True)
-        result["loss"].backward()
+        reported_loss = 0.0
+        for _ in range(arguments.gradient_accumulation):
+            try:
+                token_ids, labels = next(iterator)
+            except StopIteration:
+                iterator = iter(loader)
+                token_ids, labels = next(iterator)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                result = model(token_ids.to(device, non_blocking=True), labels.to(device, non_blocking=True))
+                loss = result["loss"] / arguments.gradient_accumulation
+            reported_loss += loss.detach().item()
+            scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         if step == 1 or step % 50 == 0:
-            print(f"step={step} loss={result['loss'].item():.4f}")
+            print(f"step={step} loss={reported_loss:.4f}")
         if step % 1_000 == 0 or step == arguments.steps:
             torch.save({"config": config, "model": model.state_dict(), "step": step},
                        arguments.output / f"checkpoint-{step}.pt")

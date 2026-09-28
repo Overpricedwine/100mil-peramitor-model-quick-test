@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from collections.abc import Callable
 
 import torch
 from torch import nn
@@ -130,11 +131,14 @@ class SceneFunctionTransformer(nn.Module):
 
     @torch.inference_mode()
     def generate(self, token_ids: torch.Tensor, *, max_new_tokens: int = 256,
-                 temperature: float = 0.7, top_k: int = 50, eos_token_id: int | None = None) -> torch.Tensor:
-        """Generate tokens. The caller must validate resulting text against grammar.py."""
+                 temperature: float = 0.7, top_k: int = 50, eos_token_id: int | None = None,
+                 logits_processor: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] | None = None) -> torch.Tensor:
+        """Generate tokens, optionally masking choices before sampling."""
         for _ in range(max_new_tokens):
             window = token_ids[:, -self.config.context_length:]
             logits = self(window)["logits"][:, -1, :]
+            if logits_processor is not None:
+                logits = logits_processor(logits, token_ids)
             if temperature <= 0:
                 next_token = logits.argmax(dim=-1, keepdim=True)
             else:

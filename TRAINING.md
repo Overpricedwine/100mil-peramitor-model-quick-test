@@ -32,12 +32,80 @@ deterministic scene specification
   -> use grader scores for ranking/repair/RL after supervised training
 ```
 
-The seed generator is intentionally deterministic. Start with it:
+The seed generator is intentionally deterministic, but its templates vary
+across buildings, vehicles, furniture, props, tools, environment objects, and
+simple creature models (robot, dog, bird, and crab).
+It includes rotations, transparency, a `finish` action, and a short revision
+conversation with edit/delete/restore targets. Function IDs are stable
+(`fn_000001`, etc.) and appear in the context before they can be targeted.
+
+Whole template families are held out: fountains are validation and rock
+clusters are test. Generate separate files rather than training on all data:
 
 ```bash
-python make_training_data.py --scenes 10000 --output data/scene_functions.jsonl
-python train_transformer.py --data data/scene_functions.jsonl --output runs/transformer --steps 10000
+python make_training_data.py --scenes 10000 --split train --output data/train.jsonl
+python make_training_data.py --scenes 10000 --split validation --output data/validation.jsonl
+python make_training_data.py --scenes 10000 --split test --output data/test.jsonl
+python train_transformer.py --data data/train.jsonl --output runs/transformer --steps 10000
 ```
+
+On the Vast GPU, use the local Qwen model to write varied training requests
+from the verified seed specifications:
+
+```bash
+python make_training_data.py --scenes 10000 --split train --request-author qwen --seed 42 \
+  --output data/train.jsonl
+```
+
+The request author alternates `minimal` and `specific` requests. Its seed and
+style hint change wording only; the known scene specification and canonical
+function trace remain the verified target.
+
+## Grader variation and continuing conversations
+
+The local VLM grader is deterministic by default so reward scores and final
+evaluation can be compared fairly. For training exploration, call
+`grade(..., suggestion_seed=123)`; it uses low-temperature sampling but the
+same seed reproduces the same repair priorities. The conversation director
+supports `decide(..., selection_seed=123)` in the same way. The grader receives
+the complete saved conversation, function history (including deleted functions)
+and the previous grade, then returns `next_objective` plus an ordered
+three-item `repair_queue`. The director selects only the first uncompleted
+repair per turn and sees the queue again after the scene is rebuilt and graded.
+Use `continue_after_grade(...)` to persist that one selected objective as a
+system turn before asking the function generator for its next JSON call.
+
+Do not use sampled grades for held-out model comparisons. Use deterministic
+grading there, and reserve seeded variation for generating diverse repair
+conversations during training.
+
+## Reward fine-tuning (first RL stage)
+
+`train.py` is only a small-policy REINFORCE smoke test. Do not use it to claim
+the 100M text Transformer has been RL trained. The practical first stage for
+the real model is **offline reward fine-tuning**: run `run_scene_cycle.py`,
+review its high-scoring `trajectory.jsonl` samples in Studio, then train with a
+reward-weighted token loss and a KL penalty that keeps the model close to its
+supervised checkpoint:
+
+```bash
+python train_rft.py --trajectories runs/my_bridge/trajectory.jsonl \
+  --checkpoint runs/transformer/checkpoint-10000.pt \
+  --tokenizer runs/transformer/scene_tokenizer.json \
+  --output runs/rft --min-score 80 --steps 1000
+```
+
+The trainer defaults to only `candidate_for_review` trajectories. That flag is
+grader-based, not a substitute for checking the Studio result; use
+`--include-unreviewed` only for an experiment. It optimizes high final grade
+and non-negative score change, and clips exponential reward weights so one
+unreliable VLM grade cannot dominate. The KL penalty is the safety leash that
+reduces grammar/language drift.
+
+Online PPO/GRPO is a later step. It needs parallel isolated sessions, saved
+old-token log-probabilities, a frozen reference policy, multi-sample advantage
+normalization, and periodic human/Studio evaluation. Add it only after the
+offline RFT checkpoint improves the held-out scenes.
 
 `scene_agent/prompt_templates.py` contains two versioned prompts. The request
 author receives the known scene specification and must only describe it. The
