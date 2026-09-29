@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -20,6 +21,55 @@ EDITABLE_PART_PROPERTIES = {
     "name", "shape", "position", "rotation", "size", "color", "material", "transparency",
     "anchored", "can_collide",
 }
+RIG_PART_ROLES = {"body", "limb", "accessory"}
+JOINT_MOTION_TYPES = {"fixed": 0, "hinge": 1, "universal": 2}
+
+
+def normalise_joint_motion(
+    motion_type: str, axes: Iterable[Iterable[float]], angle_ranges: Iterable[Iterable[float]],
+) -> tuple[str, tuple[tuple[float, float, float], ...], tuple[tuple[float, float], ...]]:
+    """Validate a generic rig joint without assuming a humanoid skeleton.
+
+    ``universal`` has two independent angular coordinates.  Each range is on a
+    circular -180..180 degree dial: a lower bound greater than its upper bound
+    intentionally means the legal interval wraps through +/-180 degrees.
+    """
+    if motion_type not in JOINT_MOTION_TYPES:
+        raise ValueError(f"motion_type must be one of {sorted(JOINT_MOTION_TYPES)}")
+    expected = JOINT_MOTION_TYPES[motion_type]
+    if (not isinstance(axes, (list, tuple)) or not isinstance(angle_ranges, (list, tuple))):
+        raise ValueError("joint axes and angle_ranges must be arrays")
+    try:
+        axes_result = tuple(tuple(float(value) for value in axis) for axis in axes)
+        ranges_result = tuple(tuple(float(value) for value in angle_range) for angle_range in angle_ranges)
+    except (TypeError, ValueError) as error:
+        raise ValueError("joint axes and angle_ranges must be numeric arrays") from error
+    if len(axes_result) != expected or len(ranges_result) != expected:
+        raise ValueError(f"{motion_type} joints require exactly {expected} axes and angle ranges")
+    normalised_axes: list[tuple[float, float, float]] = []
+    for index, axis in enumerate(axes_result, start=1):
+        raw_axis = axes[index - 1]
+        if (not isinstance(raw_axis, (list, tuple)) or len(axis) != 3
+                or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in raw_axis)
+                or not all(math.isfinite(value) for value in axis)):
+            raise ValueError(f"axis {index} must be a finite three-number vector")
+        length = math.sqrt(sum(value * value for value in axis))
+        if length < 1e-6:
+            raise ValueError(f"axis {index} must not be zero")
+        normalised_axes.append(tuple(value / length for value in axis))
+    if expected == 2:
+        dot = sum(normalised_axes[0][index] * normalised_axes[1][index] for index in range(3))
+        if abs(dot) > 0.95:
+            raise ValueError("universal joint axes must not be parallel")
+    for index, angle_range in enumerate(ranges_result, start=1):
+        raw_range = angle_ranges[index - 1]
+        if (not isinstance(raw_range, (list, tuple)) or len(angle_range) != 2
+                or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in raw_range)
+                or not all(math.isfinite(value) for value in angle_range)):
+            raise ValueError(f"angle range {index} must contain two finite numbers")
+        if any(value < -180 or value > 180 for value in angle_range):
+            raise ValueError("joint angles must be within -180 through 180 degrees")
+    return motion_type, tuple(normalised_axes), ranges_result
 
 
 @dataclass
@@ -91,6 +141,51 @@ class SceneFunction:
                    payload={"target_id": target_id, "properties": properties})
 
     @classmethod
+    def add_rig_root(
+        cls, name: str, shape: str, position: tuple[float, float, float],
+        size: tuple[float, float, float], color: tuple[float, float, float],
+        *, rotation: tuple[float, float, float] = (0, 0, 0), material: str = "SmoothPlastic",
+        transparency: float = 0.0,
+    ) -> "SceneFunction":
+        """Create the one visible root part of a generated character rig."""
+        function = cls.add_part(
+            name, shape, position, size, color, rotation=rotation, material=material,
+            transparency=transparency, anchored=False, can_collide=False,
+        )
+        function.op = "add_rig_root"
+        function.payload["role"] = "root"
+        return function
+
+    @classmethod
+    def add_rig_part(
+        cls, name: str, shape: str, position: tuple[float, float, float],
+        size: tuple[float, float, float], color: tuple[float, float, float], *,
+        parent_part_id: str, joint_name: str, joint_position: tuple[float, float, float],
+        role: str = "limb", rotation: tuple[float, float, float] = (0, 0, 0),
+        material: str = "SmoothPlastic", transparency: float = 0.0,
+        motion_type: str = "hinge", axes: Iterable[Iterable[float]] = ((1, 0, 0),),
+        angle_ranges: Iterable[Iterable[float]] = ((-45, 45),),
+    ) -> "SceneFunction":
+        """Create one part and its Motor6D connection as one reversible action."""
+        if role not in RIG_PART_ROLES:
+            raise ValueError(f"role must be one of {sorted(RIG_PART_ROLES)}")
+        if not parent_part_id or not joint_name.strip():
+            raise ValueError("rig parts require a parent part ID and joint name")
+        motion_type, axes, angle_ranges = normalise_joint_motion(motion_type, axes, angle_ranges)
+        function = cls.add_part(
+            name, shape, position, size, color, depends_on=[parent_part_id], rotation=rotation,
+            material=material, transparency=transparency, anchored=False, can_collide=False,
+        )
+        function.op = "add_rig_part"
+        function.payload.update({
+            "role": role, "parent_part_id": parent_part_id, "joint_name": joint_name,
+            "joint_position": list(joint_position), "joint_type": "Motor6D",
+            "motion_type": motion_type, "axes": [list(axis) for axis in axes],
+            "angle_ranges": [list(angle_range) for angle_range in angle_ranges],
+        })
+        return function
+
+    @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "SceneFunction":
         return cls(**value)
 
@@ -108,16 +203,59 @@ class Part:
     transparency: float = 0.0
     anchored: bool = True
     can_collide: bool = True
+    is_rig_root: bool = False
+    rig_role: str | None = None
+
+
+@dataclass
+class Joint:
+    """A constrained Motor6D created together with its child rig part."""
+
+    function_id: str
+    name: str
+    parent_part_id: str
+    child_part_id: str
+    position: tuple[float, float, float]
+    joint_type: str = "Motor6D"
+    motion_type: str = "hinge"
+    axes: tuple[tuple[float, float, float], ...] = ((1.0, 0.0, 0.0),)
+    angle_ranges: tuple[tuple[float, float], ...] = ((-45.0, 45.0),)
 
 
 @dataclass
 class SceneGraph:
     parts: list[Part] = field(default_factory=list)
+    joints: list[Joint] = field(default_factory=list)
     skipped: dict[str, str] = field(default_factory=dict)
+
+    def rig_validation(self) -> dict[str, Any]:
+        """Deterministic checks the visual grader should never have to guess."""
+        roots = [part for part in self.parts if part.is_rig_root]
+        rigged_parts = [part for part in self.parts if part.rig_role is not None]
+        issues: list[str] = []
+        if rigged_parts and len(roots) != 1:
+            issues.append("rig requires exactly one visible primary part")
+        part_ids = {part.function_id for part in self.parts}
+        child_ids: set[str] = set()
+        for joint in self.joints:
+            if joint.parent_part_id not in part_ids or joint.child_part_id not in part_ids:
+                issues.append(f"joint {joint.name} references an unavailable part")
+            if joint.child_part_id in child_ids:
+                issues.append(f"part {joint.child_part_id} has more than one parent joint")
+            child_ids.add(joint.child_part_id)
+        for part in rigged_parts:
+            if part.anchored or part.can_collide:
+                issues.append(f"rigged part {part.name} must be unanchored and non-colliding")
+            if not part.is_rig_root and part.function_id not in child_ids:
+                issues.append(f"rigged part {part.name} has no parent joint")
+        return {
+            "is_rigged": bool(rigged_parts), "root_count": len(roots),
+            "joint_count": len(self.joints), "valid": not issues, "issues": issues,
+        }
 
     def metadata(self) -> dict[str, Any]:
         if not self.parts:
-            return {"part_count": 0, "bounds": [0, 0, 0], "names": [], "shapes": []}
+            return {"part_count": 0, "joint_count": 0, "bounds": [0, 0, 0], "names": [], "shapes": []}
         minima = [min(p.position[i] - p.size[i] / 2 for p in self.parts) for i in range(3)]
         maxima = [max(p.position[i] + p.size[i] / 2 for p in self.parts) for i in range(3)]
         return {
@@ -126,13 +264,25 @@ class SceneGraph:
             "names": [p.name for p in self.parts],
             "shapes": [p.shape for p in self.parts],
             "materials": [p.material for p in self.parts],
+            "joint_count": len(self.joints),
+            "rig_roots": [p.function_id for p in self.parts if p.is_rig_root],
+            "rig_validation": self.rig_validation(),
+            "joints": [
+                {"function_id": joint.function_id, "name": joint.name,
+                 "parent_part_id": joint.parent_part_id, "child_part_id": joint.child_part_id,
+                 "position": joint.position, "joint_type": joint.joint_type,
+                 "motion_type": joint.motion_type, "axes": joint.axes,
+                 "angle_ranges": joint.angle_ranges}
+                for joint in self.joints
+            ],
             "parts": [
                 {
                     "function_id": p.function_id, "name": p.name, "shape": p.shape,
                     "position": p.position, "rotation": p.rotation, "size": p.size,
                     "color": p.color, "material": p.material,
                     "transparency": p.transparency, "anchored": p.anchored,
-                    "can_collide": p.can_collide,
+                    "can_collide": p.can_collide, "is_rig_root": p.is_rig_root,
+                    "rig_role": p.rig_role,
                 }
                 for p in self.parts
             ],
@@ -252,6 +402,26 @@ class SceneSession:
                 can_collide=bool(call.get("can_collide", True)),
             )
             return self.add_function(function).id
+        if operation == "add_rig_root":
+            function = SceneFunction.add_rig_root(
+                name=str(call["name"]), shape=str(call["shape"]), position=tuple(call["position"]),
+                size=tuple(call["size"]), color=tuple(call["color"]),
+                rotation=tuple(call.get("rotation", (0, 0, 0))), material=str(call.get("material", "SmoothPlastic")),
+                transparency=float(call.get("transparency", 0)),
+            )
+            return self.add_function(function).id
+        if operation == "add_rig_part":
+            function = SceneFunction.add_rig_part(
+                name=str(call["name"]), shape=str(call["shape"]), position=tuple(call["position"]),
+                size=tuple(call["size"]), color=tuple(call["color"]),
+                parent_part_id=str(call["parent_part_id"]), joint_name=str(call["joint_name"]),
+                joint_position=tuple(call["joint_position"]), role=str(call.get("role", "limb")),
+                rotation=tuple(call.get("rotation", (0, 0, 0))), material=str(call.get("material", "SmoothPlastic")),
+                transparency=float(call.get("transparency", 0)),
+                motion_type=str(call.get("motion_type", "hinge")), axes=call.get("axes", ((1, 0, 0),)),
+                angle_ranges=call.get("angle_ranges", ((-45, 45),)),
+            )
+            return self.add_function(function).id
         if operation == "set_part_properties":
             return self.add_function(SceneFunction.set_part_properties(
                 str(call["target_id"]), dict(call["properties"])
@@ -287,6 +457,8 @@ class SceneSession:
         valid_ids: set[str] = set()
         parts_by_id: dict[str, Part] = {}
         part_order: list[str] = []
+        joints: list[Joint] = []
+        rig_root_id: str | None = None
         for function in self.functions:
             if not function.active:
                 graph.skipped[function.id] = "deleted"
@@ -308,17 +480,36 @@ class SceneSession:
                         raise ValueError(f"unsupported properties: {sorted(unknown)}")
                     candidate = replace(target, **self._normalise_part_properties(properties))
                     self._validate_part(candidate)
+                    if candidate.rig_role is not None and (candidate.anchored or candidate.can_collide):
+                        raise ValueError("rigged parts must remain unanchored and non-colliding")
                     parts_by_id[target_id] = candidate
                 except (KeyError, TypeError, ValueError) as error:
                     graph.skipped[function.id] = str(error)
                     continue
                 valid_ids.add(function.id)
                 continue
-            if function.op != "add_part":
+            if function.op not in {"add_part", "add_rig_root", "add_rig_part"}:
                 graph.skipped[function.id] = f"unsupported operation: {function.op}"
                 continue
             payload = function.payload
             try:
+                if function.op == "add_rig_root":
+                    if rig_root_id is not None:
+                        raise ValueError("a rig may have only one active root part")
+                    if payload.get("role") != "root":
+                        raise ValueError("rig root role must be root")
+                if function.op == "add_rig_part":
+                    parent_id = str(payload.get("parent_part_id", ""))
+                    if parent_id not in parts_by_id:
+                        raise ValueError(f"rig parent is unavailable: {parent_id}")
+                    if payload.get("role") not in RIG_PART_ROLES:
+                        raise ValueError("rig part has an invalid role")
+                    if payload.get("joint_type") != "Motor6D" or not str(payload.get("joint_name", "")).strip():
+                        raise ValueError("rig part requires a named Motor6D joint")
+                    normalise_joint_motion(
+                        str(payload.get("motion_type", "hinge")), payload.get("axes", ((1, 0, 0),)),
+                        payload.get("angle_ranges", ((-45, 45),)),
+                    )
                 part = Part(
                     function_id=function.id,
                     name=str(payload["name"]),
@@ -329,17 +520,35 @@ class SceneSession:
                     color=tuple(float(x) for x in payload["color"]),
                     material=str(payload.get("material", "Plastic")),
                     transparency=float(payload.get("transparency", 0)),
-                    anchored=bool(payload.get("anchored", True)),
-                    can_collide=bool(payload.get("can_collide", True)),
+                    anchored=bool(payload.get("anchored", function.op == "add_part")),
+                    can_collide=bool(payload.get("can_collide", function.op == "add_part")),
+                    is_rig_root=function.op == "add_rig_root",
+                    rig_role=payload.get("role") if function.op in {"add_rig_root", "add_rig_part"} else None,
                 )
                 self._validate_part(part)
+                if function.op in {"add_rig_root", "add_rig_part"} and (part.anchored or part.can_collide):
+                    raise ValueError("rigged parts must be unanchored and non-colliding")
             except (KeyError, TypeError, ValueError) as error:
                 graph.skipped[function.id] = str(error)
                 continue
             parts_by_id[function.id] = part
             part_order.append(function.id)
+            if function.op == "add_rig_root":
+                rig_root_id = function.id
+            elif function.op == "add_rig_part":
+                motion_type, axes, angle_ranges = normalise_joint_motion(
+                    str(payload.get("motion_type", "hinge")), payload.get("axes", ((1, 0, 0),)),
+                    payload.get("angle_ranges", ((-45, 45),)),
+                )
+                joints.append(Joint(
+                    function_id=function.id, name=str(payload["joint_name"]),
+                    parent_part_id=str(payload["parent_part_id"]), child_part_id=function.id,
+                    position=tuple(float(x) for x in payload["joint_position"]),
+                    motion_type=motion_type, axes=axes, angle_ranges=angle_ranges,
+                ))
             valid_ids.add(function.id)
         graph.parts = [parts_by_id[function_id] for function_id in part_order if function_id in parts_by_id]
+        graph.joints = joints
         return graph
 
     @staticmethod

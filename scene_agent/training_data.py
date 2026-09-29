@@ -13,6 +13,9 @@ import random
 from typing import Any, Iterable
 
 
+CHARACTER_KINDS = ("robot", "dog", "bird", "crab")
+
+
 def _part(
     name: str, position: list[float], size: list[float], color: list[float],
     material: str = "Plastic", shape: str = "Block", rotation: list[float] | None = None,
@@ -27,13 +30,9 @@ def _part(
 
 
 def make_seed_scene(index: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    """Return a concise spec plus a valid sequence of canonical functions."""
+    """Return a rigged-character spec plus a valid sequence of canonical functions."""
     rng = random.Random(index)
-    kind = (
-        "tower", "bridge", "arch", "house", "vehicle", "furniture",
-        "crate", "street_lamp", "tree", "sword", "fountain", "rock_cluster",
-        "robot", "dog", "bird", "crab",
-    )[index % 16]
+    kind = CHARACTER_KINDS[index % len(CHARACTER_KINDS)]
     hue = [round(rng.uniform(0.15, 0.9), 2) for _ in range(3)]
     accent = [round(1 - channel * 0.55, 2) for channel in hue]
     if kind == "tower":
@@ -201,20 +200,51 @@ def make_seed_scene(index: int) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         ]
         spec = {"kind": kind, "shell_color": hue, "accent_color": accent,
                 "parts": ["rounded shell", "two raised eyes", "two wedge claws", "wide side legs"]}
+    # A single visible part becomes the character's primary/root part. Every
+    # later body piece is a one-function Part + Motor6D pair; the model never
+    # has to emit a separate skeleton-only operation for that piece.
+    root_source, *children = functions
+    root = {key: value for key, value in root_source.items() if key not in {"anchored", "can_collide"}}
+    root["op"] = "add_rig_root"
+    rigged = [root]
+    for child in children:
+        payload = {key: value for key, value in child.items() if key not in {"anchored", "can_collide"}}
+        payload.update({
+            "op": "add_rig_part", "parent_part_id": "fn_000001",
+            "joint_name": f"{payload['name']}Joint", "role": "limb",
+            "joint_position": [
+                round((root_source["position"][axis] + payload["position"][axis]) / 2, 2)
+                for axis in range(3)
+            ],
+        })
+        if "Eye" in payload["name"]:
+            payload.update({"motion_type": "fixed", "axes": [], "angle_ranges": []})
+        else:
+            payload.update({
+                "motion_type": "universal", "axes": [[1, 0, 0], [0, 1, 0]],
+                "angle_ranges": [[-45, 45], [-35, 35]],
+            })
+        rigged.append(payload)
+    functions = rigged
+    spec["asset_mode"] = "rigged_character"
+    spec["primary_part"] = root["name"]
     offset = [rng.choice([-24, -12, 0, 12, 24]), 0, rng.choice([-24, -12, 0, 12, 24])]
     for function in functions:
         function["position"] = [round(function["position"][axis] + offset[axis], 2) for axis in range(3)]
+        if "joint_position" in function:
+            function["joint_position"] = [round(function["joint_position"][axis] + offset[axis], 2)
+                                          for axis in range(3)]
     spec["local_origin"] = offset
     return spec, functions
 
 
 def split_for_scene(index: int) -> str:
-    """Hold out whole template families, not random near-duplicate variants."""
-    remainder = index % 16
-    if remainder == 10:
-        return "validation"  # fountain
-    if remainder == 11:
-        return "test"  # rock cluster
+    """Hold out whole character families, not random near-duplicate variants."""
+    remainder = index % len(CHARACTER_KINDS)
+    if remainder == 2:
+        return "validation"  # bird
+    if remainder == 3:
+        return "test"  # crab
     return "train"
 
 
@@ -240,11 +270,11 @@ def records_for_scene(
 
     def context() -> str:
         value = {
-            "user_request": request, "scene_spec": spec,
+            "asset_mode": "rigged_character", "user_request": request, "scene_spec": spec,
             "active_function_ids": [item["id"] for item in history if item["active"]],
             "active_functions": [item for item in history if item["active"]],
             "function_history": history, "conversation": turns,
-            "instruction": "Emit exactly one next canonical scene function.",
+            "instruction": "Emit exactly one next canonical rigged-character function.",
         }
         return json.dumps(value, separators=(",", ":"))
 
@@ -285,4 +315,4 @@ def records_for_scene(
 
 def deterministic_request(spec: dict[str, Any]) -> str:
     """Safe fallback while a local request-author checkpoint is unavailable."""
-    return f"Build a low-poly {spec['kind']} model with " + ", ".join(spec["parts"]) + "."
+    return f"Build a low-poly rigged {spec['kind']} character with " + ", ".join(spec["parts"]) + "."

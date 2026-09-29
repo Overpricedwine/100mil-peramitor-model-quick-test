@@ -10,7 +10,8 @@ import json
 import math
 from typing import Any
 
-from .core import ALLOWED_MATERIALS, ALLOWED_SHAPES, EDITABLE_PART_PROPERTIES
+from .core import (ALLOWED_MATERIALS, ALLOWED_SHAPES, EDITABLE_PART_PROPERTIES, JOINT_MOTION_TYPES,
+                   RIG_PART_ROLES, normalise_joint_motion)
 
 
 EDIT_ALIASES = {
@@ -20,10 +21,14 @@ EDIT_ALIASES = {
 }
 
 
-SCENE_FUNCTION_BNF = """scene_function ::= add_part | set_properties | delete | restore | finish
+SCENE_FUNCTION_BNF = """scene_function ::= add_part | add_rig_root | add_rig_part | set_properties | delete | restore | finish
 add_part       ::= {"op":"add_part","name":string,"shape":shape,"position":vec3,
                     "rotation":vec3,"size":positive_vec3,"color":rgb,"material":material,
                     "transparency":unit,"anchored":boolean,"can_collide":boolean}
+add_rig_root   ::= {"op":"add_rig_root",part_fields}
+add_rig_part   ::= {"op":"add_rig_part",part_fields,"parent_part_id":id,
+                    "joint_name":string,"joint_position":vec3,"role":rig_role,
+                    "motion_type":fixed|hinge|universal,"axes":axis_list,"angle_ranges":angle_ranges}
 set_properties ::= {"op":"set_part_properties","target_id":id,"properties":property_map}
 delete         ::= {"op":"delete_function","target_id":id}
 restore        ::= {"op":"restore_function","target_id":id}
@@ -34,6 +39,11 @@ rgb            ::= [unit,unit,unit]
 unit           ::= number from 0 through 1
 shape          ::= one of Ball | Block | Cylinder | Wedge | CornerWedge
 material       ::= one of the Roblox Enum.Material names in JSON_SCHEMA
+rig_role       ::= one of body | limb | accessory
+axis_list      ::= [] for fixed | [vec3] for hinge | [vec3,vec3] for universal
+angle_ranges   ::= [] for fixed | [[degrees,degrees]] for hinge |
+                   [[degrees,degrees],[degrees,degrees]] for universal
+degrees        ::= number from -180 through 180; lower > upper wraps through +/-180
 """
 
 
@@ -63,38 +73,76 @@ def _unit(value: Any, name: str) -> float:
     return value
 
 
+def _checked_part_fields(value: dict[str, Any], *, operation: str, allow_static_flags: bool,
+                         allow_depends_on: bool) -> dict[str, Any]:
+    """Validate the shared visible-Part data for static and rig grammar branches."""
+    allowed = {"op", "name", "shape", "position", "rotation", "size", "color", "material", "transparency"}
+    if allow_static_flags:
+        allowed |= {"anchored", "can_collide"}
+    if allow_depends_on:
+        allowed.add("depends_on")
+    required = {"op", "name", "shape", "position", "size", "color"}
+    if set(value) - allowed or required - set(value):
+        raise ValueError(f"{operation} has missing or unsupported fields")
+    if (not isinstance(value["name"], str) or not value["name"].strip()
+            or value["shape"] not in ALLOWED_SHAPES
+            or value.get("material", "Plastic") not in ALLOWED_MATERIALS):
+        raise ValueError("unknown Roblox shape or material")
+    depends_on = value.get("depends_on", [])
+    if not isinstance(depends_on, list) or not all(isinstance(item, str) and item for item in depends_on):
+        raise ValueError("depends_on must be an array of function IDs")
+    for key, default in (("anchored", True), ("can_collide", True)):
+        if key in value and not isinstance(value[key], bool):
+            raise ValueError(f"{key} must be boolean")
+    result = {
+        "op": operation, "name": value["name"], "shape": value["shape"],
+        "position": _vector(value["position"], "position"),
+        "rotation": _vector(value.get("rotation", [0, 0, 0]), "rotation"),
+        "size": _vector(value["size"], "size", positive=True),
+        "color": _vector(value["color"], "color", unit=True),
+        "material": value.get("material", "Plastic"),
+        "transparency": _unit(value.get("transparency", 0), "transparency"),
+    }
+    if allow_static_flags:
+        result.update({"anchored": value.get("anchored", True), "can_collide": value.get("can_collide", True)})
+    if allow_depends_on:
+        result["depends_on"] = depends_on
+    return result
+
+
 def validate_generated_call(value: Any) -> dict[str, Any]:
     """Return a normalized safe call or raise ValueError. Unknown fields fail."""
     if not isinstance(value, dict) or not isinstance(value.get("op"), str):
         raise ValueError("a scene function must be an object with string op")
     operation = value["op"]
     if operation == "add_part":
-        allowed = {"op", "name", "shape", "position", "rotation", "size", "color", "material",
-                   "transparency", "anchored", "can_collide", "depends_on"}
-        required = allowed - {"rotation", "material", "transparency", "anchored", "can_collide", "depends_on"}
-        if set(value) - allowed or required - set(value):
-            raise ValueError("add_part has missing or unsupported fields")
-        if (not isinstance(value["name"], str) or not value["name"].strip()
-                or value["shape"] not in ALLOWED_SHAPES
-                or value.get("material", "Plastic") not in ALLOWED_MATERIALS):
-            raise ValueError("unknown Roblox shape or material")
-        depends_on = value.get("depends_on", [])
-        if not isinstance(depends_on, list) or not all(isinstance(item, str) for item in depends_on):
-            raise ValueError("depends_on must be an array of function IDs")
-        for key, default in (("anchored", True), ("can_collide", True)):
-            if key in value and not isinstance(value[key], bool):
-                raise ValueError(f"{key} must be boolean")
-        return {
-            "op": operation, "name": value["name"], "shape": value["shape"],
-            "position": _vector(value["position"], "position"),
-            "rotation": _vector(value.get("rotation", [0, 0, 0]), "rotation"),
-            "size": _vector(value["size"], "size", positive=True),
-            "color": _vector(value["color"], "color", unit=True),
-            "material": value.get("material", "Plastic"),
-            "transparency": _unit(value.get("transparency", 0), "transparency"),
-            "anchored": value.get("anchored", True),
-            "can_collide": value.get("can_collide", True), "depends_on": depends_on,
-        }
+        return _checked_part_fields(value, operation=operation, allow_static_flags=True, allow_depends_on=True)
+    if operation == "add_rig_root":
+        return _checked_part_fields(value, operation=operation, allow_static_flags=False, allow_depends_on=False)
+    if operation == "add_rig_part":
+        rig_fields = {"parent_part_id", "joint_name", "joint_position", "role", "motion_type", "axes", "angle_ranges"}
+        base = {key: item for key, item in value.items() if key not in rig_fields}
+        result = _checked_part_fields(base, operation=operation, allow_static_flags=False, allow_depends_on=False)
+        if (not isinstance(value.get("parent_part_id"), str) or not value["parent_part_id"]
+                or not isinstance(value.get("joint_name"), str) or not value["joint_name"].strip()
+                or value.get("role", "limb") not in RIG_PART_ROLES):
+            raise ValueError("add_rig_part requires a parent ID, joint name, and valid role")
+        if not all(key in value for key in ("motion_type", "axes", "angle_ranges")):
+            raise ValueError("add_rig_part requires motion_type, axes, and angle_ranges")
+        try:
+            motion_type, axes, angle_ranges = normalise_joint_motion(
+                str(value["motion_type"]), value["axes"], value["angle_ranges"]
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"invalid joint motion: {error}") from error
+        result.update({
+            "parent_part_id": value["parent_part_id"], "joint_name": value["joint_name"],
+            "joint_position": _vector(value.get("joint_position"), "joint_position"),
+            "role": value.get("role", "limb"),
+            "motion_type": motion_type, "axes": [list(axis) for axis in axes],
+            "angle_ranges": [list(angle_range) for angle_range in angle_ranges],
+        })
+        return result
     if operation in EDIT_ALIASES:
         property_name = EDIT_ALIASES[operation]
         if set(value) != {"op", "target_id", property_name}:
@@ -169,6 +217,8 @@ def _vector_schema(item_schema: dict[str, Any]) -> dict[str, Any]:
 NUMBER_VECTOR = _vector_schema({"type": "number"})
 POSITIVE_VECTOR = _vector_schema({"type": "number", "exclusiveMinimum": 0})
 COLOR_VECTOR = _vector_schema({"type": "number", "minimum": 0, "maximum": 1})
+ANGLE_RANGE = {"type": "array", "minItems": 2, "maxItems": 2,
+               "items": {"type": "number", "minimum": -180, "maximum": 180}}
 PART_PROPERTY_SCHEMA = {
     "type": "object", "minProperties": 1, "additionalProperties": False,
     "properties": {
@@ -197,6 +247,35 @@ JSON_SCHEMA: dict[str, Any] = {
                 "transparency": {"type": "number", "minimum": 0, "maximum": 1},
                 "anchored": {"type": "boolean"}, "can_collide": {"type": "boolean"},
                 "depends_on": {"type": "array", "items": {"type": "string"}},
+            },
+        },
+        {
+            "type": "object", "additionalProperties": False,
+            "required": ["op", "name", "shape", "position", "size", "color"],
+            "properties": {
+                "op": {"const": "add_rig_root"}, "name": {"type": "string", "minLength": 1},
+                "shape": {"enum": sorted(ALLOWED_SHAPES)}, "position": NUMBER_VECTOR,
+                "rotation": NUMBER_VECTOR, "size": POSITIVE_VECTOR, "color": COLOR_VECTOR,
+                "material": {"enum": sorted(ALLOWED_MATERIALS)},
+                "transparency": {"type": "number", "minimum": 0, "maximum": 1},
+            },
+        },
+        {
+            "type": "object", "additionalProperties": False,
+            "required": ["op", "name", "shape", "position", "size", "color", "parent_part_id",
+                         "joint_name", "joint_position", "motion_type", "axes", "angle_ranges"],
+            "properties": {
+                "op": {"const": "add_rig_part"}, "name": {"type": "string", "minLength": 1},
+                "shape": {"enum": sorted(ALLOWED_SHAPES)}, "position": NUMBER_VECTOR,
+                "rotation": NUMBER_VECTOR, "size": POSITIVE_VECTOR, "color": COLOR_VECTOR,
+                "material": {"enum": sorted(ALLOWED_MATERIALS)},
+                "transparency": {"type": "number", "minimum": 0, "maximum": 1},
+                "parent_part_id": {"type": "string", "minLength": 1},
+                "joint_name": {"type": "string", "minLength": 1},
+                "joint_position": NUMBER_VECTOR, "role": {"enum": sorted(RIG_PART_ROLES)},
+                "motion_type": {"enum": sorted(JOINT_MOTION_TYPES)},
+                "axes": {"type": "array", "maxItems": 2, "items": NUMBER_VECTOR},
+                "angle_ranges": {"type": "array", "maxItems": 2, "items": ANGLE_RANGE},
             },
         },
         {

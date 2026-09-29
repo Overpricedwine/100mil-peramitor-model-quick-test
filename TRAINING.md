@@ -12,10 +12,11 @@ training assets:
    restoration, then longer conversations with existing scenes.
 5. Checkpoints, metrics, and a human-reviewed holdout set.
 
-The scene catalogue must deliberately balance buildings, objects/props,
-vehicles, furniture, tools, and environment pieces. Character or creature
-examples are optional categories, never the default. Every seed request and
-grade uses a low-poly constraint: simple primitives and readable silhouettes.
+The current catalogue is deliberately character-only: robots, dogs, birds, and
+crabs. Every trace starts with one visible primary/root part, and each later
+movable piece atomically creates its Part plus a Motor6D connection. Every seed
+request and grade uses a low-poly constraint: simple primitives and readable
+silhouettes.
 
 ## Recommended data flow
 
@@ -33,14 +34,13 @@ deterministic scene specification
 ```
 
 The seed generator is intentionally deterministic, but its templates vary
-across buildings, vehicles, furniture, props, tools, environment objects, and
-simple creature models (robot, dog, bird, and crab).
+across rigged robot, dog, bird, and crab families.
 It includes rotations, transparency, a `finish` action, and a short revision
 conversation with edit/delete/restore targets. Function IDs are stable
 (`fn_000001`, etc.) and appear in the context before they can be targeted.
 
-Whole template families are held out: fountains are validation and rock
-clusters are test. Generate separate files rather than training on all data:
+Whole character families are held out: birds are validation and crabs are test.
+Generate separate files rather than training on all data:
 
 ```bash
 python make_training_data.py --scenes 10000 --split train --output data/train.jsonl
@@ -124,7 +124,10 @@ evaluation. Review a sample of grades in Studio before using them as RL reward.
 ## Grading rubric
 
 Grade requested components/counts, layout/scale/orientation, appearance
-(colour/material/transparency), and structural plausibility separately. The
-grader must identify missing elements and suggest a concrete next repair, not
-just provide a score. It must not infer hidden geometry from a flattering camera
-angle; this is why it receives front, side and top renders plus scene metadata.
+(colour/material/transparency), and rig validity separately. Rig validity is
+first checked deterministically: one primary part, a connected Motor6D tree,
+one parent per movable part, and no anchored/colliding rigged part. It must
+also check each joint's declared degree of freedom, non-zero axes, and circular
+angle ranges. A range where the first angle is greater than the second wraps
+across -180/180 instead of being invalid. The visual grader then sees that
+report plus front, side, and top renders.

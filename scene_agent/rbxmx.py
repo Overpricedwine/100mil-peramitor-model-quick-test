@@ -4,7 +4,7 @@ import math
 from html import escape
 from pathlib import Path
 
-from .core import Part, SceneGraph
+from .core import Joint, Part, SceneGraph
 
 
 PART_TYPE_VALUES = {"Ball": 0, "Block": 1, "Cylinder": 2, "Wedge": 3, "CornerWedge": 4}
@@ -55,12 +55,47 @@ def _part_xml(part: Part) -> str:
   </Item>'''
 
 
+def _translation_frame(name: str, offset: tuple[float, float, float]) -> str:
+    x, y, z = offset
+    return (f'<CoordinateFrame name="{name}"><X>{x}</X><Y>{y}</Y><Z>{z}</Z>'
+            '<R00>1</R00><R01>0</R01><R02>0</R02><R10>0</R10><R11>1</R11><R12>0</R12>'
+            '<R20>0</R20><R21>0</R21><R22>1</R22></CoordinateFrame>')
+
+
+def _joint_xml(joint: Joint, parts_by_id: dict[str, Part]) -> str:
+    """Emit the Motor6D owned by an add_rig_part function.
+
+    The source grammar uses a world-space joint position.  These initial C0/C1
+    translations place the two joint frames at that shared point; Studio is
+    still the final authority for animation and pose validation.
+    """
+    parent, child = parts_by_id[joint.parent_part_id], parts_by_id[joint.child_part_id]
+    c0 = tuple(joint.position[index] - parent.position[index] for index in range(3))
+    c1 = tuple(joint.position[index] - child.position[index] for index in range(3))
+    return f'''  <Item class="Motor6D" referent="RBXJoint{joint.function_id}">
+    <Properties>
+      <string name="Name">{escape(joint.name)}</string>
+      <Ref name="Part0">RBX{joint.parent_part_id}</Ref>
+      <Ref name="Part1">RBX{joint.child_part_id}</Ref>
+      {_translation_frame("C0", c0)}
+      {_translation_frame("C1", c1)}
+    </Properties>
+  </Item>'''
+
+
 def to_rbxmx(graph: SceneGraph) -> str:
-    body = "\n".join(_part_xml(part) for part in graph.parts)
+    parts_by_id = {part.function_id: part for part in graph.parts}
+    roots = [part for part in graph.parts if part.is_rig_root]
+    primary_part = f'<Ref name="PrimaryPart">RBX{roots[0].function_id}</Ref>' if len(roots) == 1 else "<Ref name=\"PrimaryPart\">null</Ref>"
+    body = "\n".join([
+        *(_part_xml(part) for part in graph.parts),
+        *(_joint_xml(joint, parts_by_id) for joint in graph.joints
+          if joint.parent_part_id in parts_by_id and joint.child_part_id in parts_by_id),
+    ])
     return f'''<?xml version="1.0" encoding="UTF-8"?>
 <roblox version="4">
 <Item class="Model" referent="RBXSceneAgent">
-  <Properties><string name="Name">GeneratedScene</string></Properties>
+  <Properties><string name="Name">GeneratedScene</string>{primary_part}</Properties>
 {body}
 </Item>
 </roblox>

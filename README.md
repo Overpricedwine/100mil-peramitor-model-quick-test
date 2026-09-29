@@ -1,6 +1,7 @@
 # Roblox Scene Agent
 
-This is a CUDA-ready prototype for *render-in-the-loop* Roblox construction.
+This is a CUDA-ready prototype for *render-in-the-loop* Roblox character and
+creature construction.
 The policy proposes exactly one constrained scene function per step. Every
 function and every conversation turn are stored on disk, so a scene can be
 rebuilt, inspected, deleted, and restored later.
@@ -17,7 +18,8 @@ The prototype deliberately separates three jobs:
 
 ## Why the model never writes XML directly
 
-The model emits `SceneFunction` records such as `add_part`. The validator
+The model emits `SceneFunction` records such as `add_rig_root` and
+`add_rig_part`. The validator
 rebuilds the complete scene from those records and `rbxmx.py` emits the XML.
 Deleting a function simply marks it inactive; replay removes its part and any
 function with a now-missing dependency is skipped. Restoring it is reversible.
@@ -60,6 +62,10 @@ document fails validation and creates Studio undo waypoints.
 
 It does not run arbitrary Luau and does not need a network connection. The
 Python session document is the only allowed input.
+
+See [LUA_COMMANDS.md](LUA_COMMANDS.md) for the complete safe command catalogue,
+including the two-angle joint schema. These are constrained JSON model calls;
+they are not permission to execute arbitrary Luau.
 
 ## Grammar-constrained language
 
@@ -190,12 +196,12 @@ the original history.
 
 ## Function schema
 
-The model can place parts with their full initial transform/appearance, then
-apply reversible property edits:
+The model creates one visible primary/root body part, then adds later parts
+with their Motor6D skeleton connection in the same reversible function:
 
 ```json
-{"op":"add_part","name":"LeftTower","shape":"Block","position":[-8,5,0],"rotation":[0,0,0],"size":[4,10,4],"color":[0.6,0.6,0.7],"material":"Brick","transparency":0,"anchored":true,"can_collide":true}
-{"op":"set_material","target_id":"<function-id>","material":"Metal"}
+{"op":"add_rig_root","name":"RobotTorso","shape":"Block","position":[0,6,0],"size":[4,5,2.5],"color":[0.3,0.6,0.9],"material":"Metal"}
+{"op":"add_rig_part","name":"LeftArm","shape":"Block","position":[-3,6,0],"size":[1,4,1],"color":[0.3,0.6,0.9],"parent_part_id":"fn_000001","joint_name":"LeftShoulder","joint_position":[-2,7,0],"role":"limb","motion_type":"universal","axes":[[1,0,0],[0,1,0]],"angle_ranges":[[-45,45],[120,-120]]}
 {"op":"set_part_properties","target_id":"<function-id>","properties":{"position":[2,5,0],"transparency":0.25}}
 {"op":"delete_function","target_id":"<function-id>"}
 {"op":"restore_function","target_id":"<function-id>"}

@@ -51,6 +51,13 @@ class HeuristicGrader:
         if graph.skipped:
             score -= 20
             feedback.append("Some functions are inactive or have unmet dependencies.")
+        rig_report = graph.rig_validation()
+        if rig_report["is_rigged"]:
+            if rig_report["valid"]:
+                score += 15
+            else:
+                score -= 30
+                feedback.extend(rig_report["issues"])
         if not graph.parts:
             feedback.append("Scene is empty.")
         return Grade(score=max(0.0, min(100.0, score)), feedback=feedback, repairs=[])

@@ -9,6 +9,7 @@ local HttpService = game:GetService("HttpService")
 local Workspace = game:GetService("Workspace")
 
 local PART_TYPES = {Ball = true, Block = true, Cylinder = true, Wedge = true, CornerWedge = true}
+local JOINT_DEGREES_OF_FREEDOM = {fixed = 0, hinge = 1, universal = 2}
 local EDITABLE = {
 	name = true, shape = true, position = true, rotation = true, size = true, color = true,
 	material = true, transparency = true, anchored = true, can_collide = true,
@@ -70,7 +71,7 @@ local function setProperties(part, properties)
 	end
 end
 
-local function makePart(functionId, payload)
+local function makePart(functionId, payload, rigged)
 	expect(type(payload.name) == "string" and #payload.name > 0, "add_part requires a name")
 	expect(PART_TYPES[payload.shape], "add_part uses unsupported shape")
 	local part = Instance.new("Part")
@@ -84,10 +85,62 @@ local function makePart(functionId, payload)
 		color = payload.color,
 		material = payload.material or "Plastic",
 		transparency = payload.transparency or 0,
-		anchored = payload.anchored ~= false,
-		can_collide = payload.can_collide ~= false,
+		anchored = rigged and false or payload.anchored ~= false,
+		can_collide = rigged and false or payload.can_collide ~= false,
 	})
 	return part
+end
+
+local function readJointMotion(payload)
+	local motionType = payload.motion_type
+	expect(type(motionType) == "string" and JOINT_DEGREES_OF_FREEDOM[motionType] ~= nil,
+		"add_rig_part requires motion_type fixed, hinge, or universal")
+	local degreesOfFreedom = JOINT_DEGREES_OF_FREEDOM[motionType]
+	expect(type(payload.axes) == "table" and #payload.axes == degreesOfFreedom,
+		"joint axes do not match motion_type")
+	expect(type(payload.angle_ranges) == "table" and #payload.angle_ranges == degreesOfFreedom,
+		"joint angle_ranges do not match motion_type")
+	local axes, ranges = {}, {}
+	for index = 1, degreesOfFreedom do
+		local axis = vec3(payload.axes[index], "axes[" .. index .. "]")
+		expect(axis.Magnitude > 0.000001, "joint axis must not be zero")
+		axes[index] = axis.Unit
+		local range = payload.angle_ranges[index]
+		expect(type(range) == "table" and #range == 2 and type(range[1]) == "number" and type(range[2]) == "number",
+			"each joint angle range must be [min,max]")
+		expect(range[1] >= -180 and range[1] <= 180 and range[2] >= -180 and range[2] <= 180,
+			"joint angles must be between -180 and 180")
+		ranges[index] = range
+	end
+	if degreesOfFreedom == 2 then
+		expect(math.abs(axes[1]:Dot(axes[2])) <= 0.95, "universal joint axes must not be parallel")
+	end
+	return motionType, axes, ranges
+end
+
+local function makeMotor6D(functionId, payload, parentPart, childPart)
+	expect(type(payload.parent_part_id) == "string" and #payload.parent_part_id > 0,
+		"add_rig_part requires parent_part_id")
+	expect(type(payload.joint_name) == "string" and #payload.joint_name > 0,
+		"add_rig_part requires joint_name")
+	local jointPosition = vec3(payload.joint_position, "joint_position")
+	local motionType, axes, ranges = readJointMotion(payload)
+	local joint = Instance.new("Motor6D")
+	joint.Name = payload.joint_name
+	joint.Part0 = parentPart
+	joint.Part1 = childPart
+	joint.C0 = parentPart.CFrame:ToObjectSpace(CFrame.new(jointPosition))
+	joint.C1 = childPart.CFrame:ToObjectSpace(CFrame.new(jointPosition))
+	joint:SetAttribute("SceneAgentFunctionId", functionId)
+	joint:SetAttribute("SceneAgentMotionType", motionType)
+	for index, axis in ipairs(axes) do
+		joint:SetAttribute("SceneAgentAxis" .. index, axis)
+		joint:SetAttribute("SceneAgentRange" .. index .. "Min", ranges[index][1])
+		joint:SetAttribute("SceneAgentRange" .. index .. "Max", ranges[index][2])
+		joint:SetAttribute("SceneAgentRange" .. index .. "Wraps", ranges[index][1] > ranges[index][2])
+	end
+	joint.Parent = childPart
+	return joint
 end
 
 local function rebuild(document)
@@ -97,6 +150,7 @@ local function rebuild(document)
 	staging:SetAttribute("SceneAgentTitle", tostring(document.title or "Untitled scene"))
 	local partsByFunction = {}
 	local applied = {}
+	local rootPart = nil
 
 	local ok, message = pcall(function()
 		for index, entry in ipairs(document.functions) do
@@ -107,8 +161,24 @@ local function rebuild(document)
 					expect(applied[dependency], "function " .. entry.id .. " has unavailable dependency " .. dependency)
 				end
 				if entry.op == "add_part" then
-					local part = makePart(entry.id, entry.payload or {})
+					local part = makePart(entry.id, entry.payload or {}, false)
 					part.Parent = staging
+					partsByFunction[entry.id] = part
+					applied[entry.id] = true
+				elseif entry.op == "add_rig_root" then
+					expect(rootPart == nil, "a character rig can have only one active primary part")
+					local part = makePart(entry.id, entry.payload or {}, true)
+					part.Parent = staging
+					partsByFunction[entry.id] = part
+					rootPart = part
+					applied[entry.id] = true
+				elseif entry.op == "add_rig_part" then
+					local payload = entry.payload or {}
+					local parentPart = partsByFunction[payload.parent_part_id]
+					expect(parentPart ~= nil, "rig part targets unavailable parent " .. tostring(payload.parent_part_id))
+					local part = makePart(entry.id, payload, true)
+					part.Parent = staging
+					makeMotor6D(entry.id, payload, parentPart, part)
 					partsByFunction[entry.id] = part
 					applied[entry.id] = true
 				elseif entry.op == "set_part_properties" then
@@ -131,6 +201,7 @@ local function rebuild(document)
 	ChangeHistoryService:SetWaypoint("Scene Agent: before rebuild")
 	local existing = Workspace:FindFirstChild("GeneratedScene")
 	if existing then existing:Destroy() end
+	if rootPart then staging.PrimaryPart = rootPart end
 	staging.Parent = Workspace
 	ChangeHistoryService:SetWaypoint("Scene Agent: rebuilt generated scene")
 	return #staging:GetChildren()
