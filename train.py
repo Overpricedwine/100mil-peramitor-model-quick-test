@@ -7,7 +7,7 @@ import torch
 
 from scene_agent.core import SceneSession
 from scene_agent.environment import RenderInTheLoopEnv
-from scene_agent.grader import HeuristicGrader, LocalQwenVLGrader
+from scene_agent.grader import DEFAULT_VISUAL_GRADER_MODEL, HeuristicGrader, LocalQwenVLGrader
 from scene_agent.policy import CudaFunctionPolicy
 from scene_agent.renderer import CudaSurrogateRenderer
 
@@ -55,6 +55,6 @@ if __name__ == "__main__":
     parser.add_argument("--steps", type=int, default=64)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--grader", choices=("local", "heuristic"), default="local")
-    parser.add_argument("--model-id", default="Qwen/Qwen2.5-VL-3B-Instruct")
+    parser.add_argument("--model-id", default=DEFAULT_VISUAL_GRADER_MODEL)
     arguments = parser.parse_args()
     train(arguments.project, arguments.steps, arguments.learning_rate, arguments.grader, arguments.model_id)
