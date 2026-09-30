@@ -36,7 +36,8 @@ class CudaBeautyRenderer(CudaSurrogateRenderer):
 
     def _bounds(self, graph: SceneGraph) -> tuple[torch.Tensor, torch.Tensor]:
         if not graph.parts:
-            return (torch.tensor([-8, 0, -8.0], device=self.device), torch.tensor([8, 12, 8.0], device=self.device))
+            return (torch.tensor([-8.0, 0.0, -8.0], device=self.device),
+                    torch.tensor([8.0, 12.0, 8.0], device=self.device))
         positions = torch.tensor([part.position for part in graph.parts], device=self.device)
         half_sizes = torch.tensor([part.size for part in graph.parts], device=self.device) / 2
         return (positions - half_sizes).amin(dim=0), (positions + half_sizes).amax(dim=0)
@@ -46,13 +47,13 @@ class CudaBeautyRenderer(CudaSurrogateRenderer):
         span = (maximum - minimum).clamp_min(4)
         radius = float(span.norm().item()) * 0.9 + 6
         if name == "front":
-            position, target, up, ortho = center + torch.tensor([0, 0, radius], device=self.device), center, torch.tensor([0, 1, 0], device=self.device), True
+            position, target, up, ortho = center + torch.tensor([0.0, 0.0, radius], device=self.device), center, torch.tensor([0.0, 1.0, 0.0], device=self.device), True
         elif name == "side":
-            position, target, up, ortho = center + torch.tensor([radius, 0, 0], device=self.device), center, torch.tensor([0, 1, 0], device=self.device), True
+            position, target, up, ortho = center + torch.tensor([radius, 0.0, 0.0], device=self.device), center, torch.tensor([0.0, 1.0, 0.0], device=self.device), True
         elif name == "top":
-            position, target, up, ortho = center + torch.tensor([0, radius, 0], device=self.device), center, torch.tensor([0, 0, -1], device=self.device), True
+            position, target, up, ortho = center + torch.tensor([0.0, radius, 0.0], device=self.device), center, torch.tensor([0.0, 0.0, -1.0], device=self.device), True
         else:
-            position, target, up, ortho = center + torch.tensor([radius * 0.72, radius * 0.52, radius * 0.72], device=self.device), center, torch.tensor([0, 1, 0], device=self.device), False
+            position, target, up, ortho = center + torch.tensor([radius * 0.72, radius * 0.52, radius * 0.72], device=self.device), center, torch.tensor([0.0, 1.0, 0.0], device=self.device), False
         forward = target - position
         forward = forward / forward.norm()
         right = torch.linalg.cross(forward, up)

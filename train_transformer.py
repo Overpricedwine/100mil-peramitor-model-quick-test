@@ -14,20 +14,24 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
 from scene_agent.grammar import validate_generated_call
-from scene_agent.prompt_templates import FUNCTION_GENERATOR_SYSTEM_PROMPT
+from scene_agent.preset_calls import encode_preset_call
+from scene_agent.prompt_templates import FUNCTION_GENERATOR_SYSTEM_PROMPT, PRESET_FUNCTION_GENERATOR_SYSTEM_PROMPT
 from scene_agent.tokenizer import SceneBPETokenizer
 from scene_agent.transformer import SceneFunctionTransformer, TransformerConfig
 
 
 class FunctionDataset(Dataset):
-    def __init__(self, path: Path, tokenizer: SceneBPETokenizer, context_length: int) -> None:
+    def __init__(self, path: Path, tokenizer: SceneBPETokenizer, context_length: int, *, target_format: str) -> None:
         self.items: list[tuple[torch.Tensor, torch.Tensor]] = []
         for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
             if not line.strip():
                 continue
             record = json.loads(line)
-            target = json.dumps(validate_generated_call(json.loads(record["target"])), separators=(",", ":"))
-            prefix = f"<scene>\n{FUNCTION_GENERATOR_SYSTEM_PROMPT}\n{record['context']}\n</scene>\n<function>\n"
+            call = validate_generated_call(json.loads(record["target"]))
+            target = (encode_preset_call(call, record["context"]) if target_format == "preset"
+                      else json.dumps(call, separators=(",", ":")))
+            system_prompt = PRESET_FUNCTION_GENERATOR_SYSTEM_PROMPT if target_format == "preset" else FUNCTION_GENERATOR_SYSTEM_PROMPT
+            prefix = f"<scene>\n{system_prompt}\n{record['context']}\n</scene>\n<function>\n"
             prefix_ids = tokenizer.encode(prefix, add_bos=True)
             target_ids = tokenizer.encode(target, add_eos=True)
             token_ids = (prefix_ids + target_ids)[-context_length:]
@@ -61,6 +65,8 @@ def main() -> None:
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--tokenizer", type=Path)
     parser.add_argument("--precision", choices=("auto", "bf16", "fp16", "fp32"), default="auto")
+    parser.add_argument("--target-format", choices=("preset", "json"), default="preset",
+                        help="Train compact preset ID + numeric calls (recommended) or legacy JSON.")
     parser.add_argument("--resume", type=Path,
                         help="Checkpoint to resume. Includes the model and AdamW optimizer state.")
     parser.add_argument("--checkpoint-every", type=int, default=1_000,
@@ -92,7 +98,8 @@ def main() -> None:
     # this fixed model vocabulary.
     config = TransformerConfig()
     model = SceneFunctionTransformer(config).to(device)
-    dataset = FunctionDataset(arguments.data, tokenizer, config.context_length)
+    dataset = FunctionDataset(arguments.data, tokenizer, config.context_length,
+                              target_format=arguments.target_format)
     loader = DataLoader(dataset, batch_size=arguments.batch_size, shuffle=True,
                         collate_fn=lambda batch: collate(batch, tokenizer.pad_id), pin_memory=device.type == "cuda")
     if device.type == "cuda":
@@ -122,7 +129,8 @@ def main() -> None:
     amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(precision)
     scaler = torch.cuda.amp.GradScaler(enabled=precision == "fp16")
     effective_batch = arguments.batch_size * arguments.gradient_accumulation
-    print(f"device={device}; precision={precision}; parameters={model.parameter_count:,}; examples={len(dataset):,}; "
+    print(f"device={device}; precision={precision}; target_format={arguments.target_format}; "
+          f"parameters={model.parameter_count:,}; examples={len(dataset):,}; "
           f"micro_batch={arguments.batch_size}; effective_batch={effective_batch}")
     model.train()
     iterator = iter(loader)

@@ -11,6 +11,29 @@ from .grammar import parse_generated_json
 
 
 _OUTSIDE_STRING = set('{}[],:-.+0123456789eEtrufalsn \t\r\n')
+_OPERATION_PREFIX = '{"op":"'
+_CANONICAL_OPERATIONS = (
+    "add_part", "add_rig_root", "add_rig_part", "set_part_properties",
+    "delete_function", "restore_function", "finish",
+)
+
+
+def is_canonical_operation_prefix(text: str) -> bool:
+    """Require the first JSON member to select a supported function.
+
+    The model is never allowed to invent an operation name.  It may choose one
+    of the prebuilt functions, but only after producing the fixed ``{"op":``
+    envelope.  Once the operation's closing quote is present, ordinary JSON
+    prefix validation handles that function's arguments; the final validator
+    remains the authority for its complete schema.
+    """
+    if not text.startswith(_OPERATION_PREFIX):
+        return _OPERATION_PREFIX.startswith(text)
+    remainder = text[len(_OPERATION_PREFIX):]
+    return any(
+        operation.startswith(remainder) or remainder.startswith(operation + '"')
+        for operation in _CANONICAL_OPERATIONS
+    )
 
 
 def is_json_object_prefix(text: str) -> bool:
@@ -88,7 +111,16 @@ class GrammarLogitsProcessor:
                        ("<pad>", "<bos>", "<eos>", "<scene>", "</scene>", "<function>")}
         self._special_ids = {token_id for token_id in special_ids if token_id is not None}
 
-    def allowed_token_ids(self, generated_ids: list[int]) -> list[int]:
+    def allowed_token_ids(self, generated_ids: list[int], candidate_ids: list[int] | None = None) -> list[int]:
+        """Return grammar-safe continuations.
+
+        ``candidate_ids`` lets the CUDA decoder test only its most likely
+        tokens first.  The previous implementation evaluated every BPE token
+        (thousands of Python JSON-prefix checks) on every generated token,
+        making practical constrained inference far slower than the model.
+        We retain a complete-vocabulary fallback in ``__call__``, so this is a
+        performance change rather than a relaxation of the safety boundary.
+        """
         text = self.tokenizer.decode(generated_ids)
         try:
             parse_generated_json(text)
@@ -100,10 +132,20 @@ class GrammarLogitsProcessor:
             return [self.tokenizer.eos_id]
 
         allowed: list[int] = []
-        for token_id, piece in enumerate(self._pieces):
+        token_ids = candidate_ids if candidate_ids is not None else range(len(self._pieces))
+        for token_id in token_ids:
+            piece = self._pieces[token_id]
             if token_id in self._special_ids or not piece:
                 continue
+            # JSON may have harmless leading whitespace in general, but this
+            # function language has no reason to generate it.  Requiring the
+            # opening brace at token zero prevents a weak checkpoint from
+            # consuming its entire function budget with spaces/newlines.
+            if not text and not piece.startswith("{"):
+                continue
             candidate = text + piece
+            if not is_canonical_operation_prefix(candidate):
+                continue
             if not is_json_object_prefix(candidate):
                 continue
             # A close that creates a complete but schema-invalid object cannot
@@ -121,13 +163,21 @@ class GrammarLogitsProcessor:
         if logits.shape[0] != 1:
             raise ValueError("grammar-constrained generation supports batch size 1")
         generated_ids = token_ids[0, self.prompt_length:].tolist()
-        allowed = self.allowed_token_ids(generated_ids)
+        # The model's output layer has 16,384 entries while the compact BPE
+        # vocabulary is smaller.  First ask its top 512 *representable* tokens
+        # and only scan all BPE entries if none can continue valid JSON.
+        import torch
+
+        usable = logits[:, :len(self._pieces)]
+        candidate_count = min(512, usable.shape[-1])
+        candidates = torch.topk(usable, candidate_count, dim=-1).indices[0].tolist()
+        allowed = self.allowed_token_ids(generated_ids, candidates)
+        if not allowed:
+            allowed = self.allowed_token_ids(generated_ids)
         if not allowed:
             raise ValueError("generation reached a grammar dead end")
         # Import only when this CUDA inference path is actually used.  Prefix
         # validation itself should work on a CPU-only development machine.
-        import torch
-
         constrained = torch.full_like(logits, float("-inf"))
         constrained[:, allowed] = logits[:, allowed]
         return constrained
